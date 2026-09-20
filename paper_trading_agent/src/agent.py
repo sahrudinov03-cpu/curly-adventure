@@ -18,6 +18,7 @@ import logging
 from pathlib import Path
 
 from .market_data import MarketDataSource, poll_loop
+from .news_source import NewsDataSource
 from .portfolio import PaperPortfolio
 from .risk import RiskManager
 from .strategy import Direction, SmaCrossoverStrategy
@@ -35,6 +36,7 @@ class TradingAgent:
         risk_manager: RiskManager,
         state_dir: str | Path = "state",
         history_max_len: int = 500,
+        news_source: NewsDataSource | None = None,
     ):
         self.data_source = data_source
         self.symbol = symbol
@@ -44,10 +46,12 @@ class TradingAgent:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.history_max_len = history_max_len
+        self.news_source = news_source
 
         self.price_history: list[float] = []
         self._current_day = dt.date.today()
         self._log_path = self.state_dir / "trade_log.csv"
+        self._news_log_path = self.state_dir / "news_log.csv"
         self._init_log()
 
     def _init_log(self) -> None:
@@ -55,6 +59,10 @@ class TradingAgent:
             with self._log_path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["iteration", "timestamp", "price", "signal", "confidence", "action", "cash", "position_qty", "equity"])
+        if self.news_source is not None and not self._news_log_path.exists():
+            with self._news_log_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["iteration", "timestamp", "event_type", "text", "belief_up_after"])
 
     def _log_row(self, iteration: int, price: float, signal_dir: str, confidence: float, action: str) -> None:
         equity = self.portfolio.equity(price)
@@ -69,6 +77,20 @@ class TradingAgent:
         if today != self._current_day:
             self._current_day = today
             self.risk_manager.reset_day(equity)
+
+    def _poll_news(self, iteration: int) -> None:
+        if self.news_source is None:
+            return
+        for item in self.news_source.poll_new():
+            if hasattr(self.strategy, "on_news"):
+                self.strategy.on_news(item)
+                belief = getattr(self.strategy, "belief_up", "")
+            else:
+                belief = ""
+            with self._news_log_path.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([iteration, dt.datetime.fromtimestamp(item.timestamp).isoformat(), item.event_type, item.text, belief])
+            logger.info("news iter=%s type=%s belief_up=%s text=%s", iteration, item.event_type, belief, item.text)
 
     def step(self, iteration: int, price: float) -> str:
         self.price_history.append(price)
@@ -113,5 +135,6 @@ class TradingAgent:
 
     def run(self, interval_sec: float, max_iterations: int | None = None) -> None:
         for iteration, price in poll_loop(self.data_source, self.symbol, interval_sec, max_iterations):
+            self._poll_news(iteration)
             self.step(iteration, price)
             self.portfolio.save(self.state_dir / "portfolio.json", price)
